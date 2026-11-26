@@ -1,0 +1,13 @@
+{
+  "seedhorizon.configuration.title": "SeedHorizon Settings",
+  "seedhorizon.configuration.enabled": "Enable SeedHorizon LOD",
+  "seedhorizon.configuration.lodRenderDistance": "LOD Horizon Distance (Chunks)",
+  "seedhorizon.configuration.realRenderDistanceCap": "Real World Render Distance Cap (Chunks)",
+  "seedhorizon.configuration.nearLodStepBlocks": "Near LOD Sample Step (Blocks)",
+  "seedhorizon.configuration.farLodStepBlocks": "Far LOD Sample Step (Blocks)",
+  "seedhorizon.configuration.enableFogPushback": "Push Fog to LOD Horizon",
+  "seedhorizon.configuration.fogStartFraction": "Fog Start Fraction",
+  "seedhorizon.configuration.fogEndFraction": "Fog End Fraction",
+  "seedhorizon.configuration.syncIntegratedServerViewDistance": "Cap Singleplayer Server View Distance",
+  "seedhorizon.configuration.showF3DebugInfo": "Show SeedHorizon in F3 Debug"
+}
