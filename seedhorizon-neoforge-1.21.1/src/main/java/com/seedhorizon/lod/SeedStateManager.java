@@ -20,6 +20,7 @@ import net.minecraft.world.level.chunk.ChunkGenerator;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.RandomState;
+import net.minecraft.world.level.levelgen.synth.NormalNoise;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent;
 import org.jetbrains.annotations.Nullable;
@@ -141,9 +142,11 @@ public final class SeedStateManager {
         }
 
         Holder<NoiseGeneratorSettings> settingsHolder = registries
-                .lookupOrThrow(Registries.NOISE_GENERATOR_SETTINGS)
+                .lookupOrThrow(Registries.NOISE_SETTINGS)
                 .getOrThrow(settingsKey);
-        RandomState randomState = RandomState.create(registries, settingsKey, seed);
+        HolderLookup.RegistryLookup<NormalNoise.NoiseParameters> noiseLookup = registries
+                .lookupOrThrow(Registries.NOISE);
+        RandomState randomState = RandomState.create(settingsHolder.value(), noiseLookup, seed);
         return new SeedContext(dim, seed, randomState, biomeSource, settingsHolder.value());
     }
 }
