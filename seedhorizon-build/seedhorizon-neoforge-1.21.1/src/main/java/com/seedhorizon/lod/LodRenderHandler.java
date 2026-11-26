@@ -1,7 +1,7 @@
 package com.seedhorizon.lod;
 
+import com.mojang.blaze3d.pipeline.RenderTarget;
 import com.mojang.blaze3d.systems.RenderSystem;
-import com.mojang.blaze3d.vertex.PoseStack;
 import com.mojang.blaze3d.vertex.VertexBuffer;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import com.seedhorizon.SeedHorizonMod;
@@ -10,11 +10,10 @@ import com.seedhorizon.config.SeedHorizonConfig;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
-import net.minecraft.client.renderer.GameRenderer;
-import net.minecraft.client.renderer.ShaderInstance;
 import net.minecraft.client.renderer.culling.Frustum;
 import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.Component;
+import net.minecraft.util.Mth;
 import net.minecraft.world.phys.Vec3;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.neoforge.client.event.ClientPlayerNetworkEvent;
@@ -23,7 +22,12 @@ import net.neoforged.neoforge.client.event.CustomizeGuiOverlayEvent;
 import net.neoforged.neoforge.client.event.RegisterClientCommandsEvent;
 import net.neoforged.neoforge.client.event.RenderLevelStageEvent;
 import org.joml.Matrix4f;
+import org.lwjgl.opengl.GL11;
+import org.lwjgl.opengl.GL13;
+import org.lwjgl.opengl.GL20;
+import org.lwjgl.system.MemoryStack;
 
+import java.nio.FloatBuffer;
 import java.util.Iterator;
 import java.util.Map;
 import java.util.Set;
@@ -33,19 +37,20 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Manages async SeedGen LOD section generation, eviction, Sodium-compatible rendering,
- * and client commands.
+ * Manages 1x1-chunk async SeedGen LOD generation, pixel-exact camera alignment via
+ * {@code event.getModelViewMatrix()}, and Distant-Horizons-style depth-occluded rendering.
  */
 public final class LodRenderHandler {
-    private static final int MAX_UPLOADS_PER_FRAME = 6;
-    private static final int MAX_IN_FLIGHT = 24;
+    private static final int MAX_UPLOADS_PER_FRAME = 16;
+    private static final int MAX_IN_FLIGHT = 40;
 
     private static final Map<Long, LodSection> SECTIONS = new ConcurrentHashMap<>();
     private static final Set<Long> IN_FLIGHT = ConcurrentHashMap.newKeySet();
     private static final ConcurrentLinkedQueue<LodSection> PENDING_UPLOADS = new ConcurrentLinkedQueue<>();
+    private static final LodShader LOD_SHADER = new LodShader();
 
     private static final ExecutorService WORKER_POOL = Executors.newFixedThreadPool(
-            Math.max(1, Math.min(4, Runtime.getRuntime().availableProcessors() / 2)),
+            Math.max(2, Math.min(6, Runtime.getRuntime().availableProcessors() / 2)),
             r -> {
                 Thread t = new Thread(r, "SeedHorizon-LOD-Worker");
                 t.setDaemon(true);
@@ -57,8 +62,8 @@ public final class LodRenderHandler {
     private LodRenderHandler() {
     }
 
-    private static long packKey(int sx, int sz) {
-        return (((long) sx) << 32) | (sz & 0xFFFFFFFFL);
+    private static long packKey(int cx, int cz) {
+        return (((long) cx) << 32) | (cz & 0xFFFFFFFFL);
     }
 
     public static void clearAll() {
@@ -76,6 +81,8 @@ public final class LodRenderHandler {
     @SubscribeEvent
     public static void onLoggingOut(ClientPlayerNetworkEvent.LoggingOut event) {
         clearAll();
+        LOD_SHADER.destroy();
+        LodAtlasSprites.invalidate();
         lastDimensionId = "";
     }
 
@@ -107,31 +114,29 @@ public final class LodRenderHandler {
 
         int playerChunkX = mc.player.chunkPosition().x;
         int playerChunkZ = mc.player.chunkPosition().z;
-        int playerSecX = Math.floorDiv(playerChunkX, LodSection.SIZE_CHUNKS);
-        int playerSecZ = Math.floorDiv(playerChunkZ, LodSection.SIZE_CHUNKS);
 
         int lodChunks = SeedHorizonConfig.getLodRenderDistance();
         int realCapChunks = SeedHorizonConfig.getRealRenderDistanceCap();
-        int maxSecRadius = (lodChunks / LodSection.SIZE_CHUNKS) + 1;
-        int minRealSecRadius = Math.max(0, (realCapChunks - 2) / LodSection.SIZE_CHUNKS);
+        // Start generating well inside the cap so unloaded/circular edge chunks have zero sky gap
+        int minRadius = Math.max(1, realCapChunks - 3);
 
-        // Evict out-of-range sections
-        int evictRadius = maxSecRadius + 3;
+        // Evict out-of-range chunks
+        int evictRadius = lodChunks + 4;
         Iterator<Map.Entry<Long, LodSection>> it = SECTIONS.entrySet().iterator();
         while (it.hasNext()) {
             LodSection sec = it.next().getValue();
-            if (Math.abs(sec.getSectionX() - playerSecX) > evictRadius
-                    || Math.abs(sec.getSectionZ() - playerSecZ) > evictRadius) {
+            if (Math.abs(sec.getChunkX() - playerChunkX) > evictRadius
+                    || Math.abs(sec.getChunkZ() - playerChunkZ) > evictRadius) {
                 sec.close();
                 it.remove();
             }
         }
 
-        // Schedule missing sections in concentric rings
-        int nearStep = SeedHorizonConfig.CLIENT.nearLodStepBlocks.get();
+        int fullDetailMaxRadius = realCapChunks + SeedHorizonConfig.CLIENT.fullDetailExtraChunks.get();
+        int midStep = SeedHorizonConfig.CLIENT.midLodStepBlocks.get();
         int farStep = SeedHorizonConfig.CLIENT.farLodStepBlocks.get();
 
-        for (int r = minRealSecRadius; r <= maxSecRadius; r++) {
+        for (int r = minRadius; r <= lodChunks; r++) {
             if (IN_FLIGHT.size() >= MAX_IN_FLIGHT) {
                 break;
             }
@@ -143,20 +148,20 @@ public final class LodRenderHandler {
                     if (IN_FLIGHT.size() >= MAX_IN_FLIGHT) {
                         break;
                     }
-                    int sx = playerSecX + dx;
-                    int sz = playerSecZ + dz;
-                    long key = packKey(sx, sz);
+                    int cx = playerChunkX + dx;
+                    int cz = playerChunkZ + dz;
+                    long key = packKey(cx, cz);
                     if (SECTIONS.containsKey(key) || !IN_FLIGHT.add(key)) {
                         continue;
                     }
 
-                    int step = (r <= 8) ? nearStep : farStep;
+                    int step = (r <= fullDetailMaxRadius) ? 1 : ((r <= 20) ? midStep : farStep);
                     WORKER_POOL.execute(() -> {
                         try {
-                            LodSection generated = LodSection.generate(ctx, sx, sz, step);
+                            LodSection generated = LodSection.generate(ctx, cx, cz, step);
                             PENDING_UPLOADS.add(generated);
                         } catch (Exception e) {
-                            SeedHorizonMod.LOGGER.debug("LOD generation failed at ({}, {}): {}", sx, sz, e.getMessage());
+                            SeedHorizonMod.LOGGER.debug("LOD generation failed at ({}, {}): {}", cx, cz, e.getMessage());
                         } finally {
                             IN_FLIGHT.remove(key);
                         }
@@ -168,7 +173,8 @@ public final class LodRenderHandler {
 
     @SubscribeEvent
     public static void onRenderLevelStage(RenderLevelStageEvent event) {
-        if (event.getStage() != RenderLevelStageEvent.Stage.AFTER_SOLID_BLOCKS) {
+        // Render right after translucent/cutout terrain so mainTarget depth buffer contains ALL real blocks
+        if (event.getStage() != RenderLevelStageEvent.Stage.AFTER_CUTOUT_BLOCKS) {
             return;
         }
         if (!SeedHorizonConfig.isActive()) {
@@ -181,7 +187,6 @@ public final class LodRenderHandler {
             return;
         }
 
-        // Upload a bounded number of generated sections per frame to prevent stutter
         int uploadedThisFrame = 0;
         while (uploadedThisFrame < MAX_UPLOADS_PER_FRAME) {
             LodSection sec = PENDING_UPLOADS.poll();
@@ -189,7 +194,7 @@ public final class LodRenderHandler {
                 break;
             }
             sec.uploadToGpu();
-            long key = packKey(sec.getSectionX(), sec.getSectionZ());
+            long key = packKey(sec.getChunkX(), sec.getChunkZ());
             LodSection old = SECTIONS.put(key, sec);
             if (old != null) {
                 old.close();
@@ -197,12 +202,14 @@ public final class LodRenderHandler {
             uploadedThisFrame++;
         }
 
-        if (SECTIONS.isEmpty()) {
+        if (SECTIONS.isEmpty() || !LOD_SHADER.ensureInitialized()) {
             return;
         }
 
-        ShaderInstance shader = GameRenderer.getPositionColorShader();
-        if (shader == null) {
+        RenderTarget mainTarget = mc.getMainRenderTarget();
+        int viewW = mainTarget.viewWidth;
+        int viewH = mainTarget.viewHeight;
+        if (viewW <= 0 || viewH <= 0) {
             return;
         }
 
@@ -210,25 +217,70 @@ public final class LodRenderHandler {
         Vec3 camPos = camera.getPosition();
         Frustum frustum = event.getFrustum();
 
-        int playerChunkX = mc.player.chunkPosition().x;
-        int playerChunkZ = mc.player.chunkPosition().z;
-        int realCap = SeedHorizonConfig.getRealRenderDistanceCap();
-        // Leave a 1-chunk overlap skirt at the real-world boundary so chunks streaming in have no gap
-        int skipRealInnerChunks = Math.max(1, realCap - 1);
-
-        PoseStack poseStack = event.getPoseStack();
-        poseStack.pushPose();
-        poseStack.translate(-camPos.x, -camPos.y, -camPos.z);
-
-        Matrix4f modelView = new Matrix4f(RenderSystem.getModelViewMatrix());
-        modelView.mul(poseStack.last().pose());
+        // CRITICAL FIX: Use event.getModelViewMatrix() (actual camera rotation), NOT RenderSystem.getModelViewMatrix(),
+        // then translate by -camPos so LOD world coordinates lock pixel-for-pixel onto real Minecraft chunks!
+        Matrix4f modelView = new Matrix4f(event.getModelViewMatrix())
+                .translate((float) -camPos.x, (float) -camPos.y, (float) -camPos.z);
         Matrix4f projection = event.getProjectionMatrix();
+
+        float partialTick = event.getPartialTick().getGameTimeDeltaPartialTick(true);
+        float sunAngle = level.getSunAngle(partialTick);
+        float sunCos = Mth.cos(sunAngle);
+        float day = Mth.clamp(sunCos * 1.6f + 0.35f, 0.0f, 1.0f);
+        float sunset = Mth.clamp(1.0f - Math.abs(sunCos) * 4.0f, 0.0f, 1.0f);
+        float rain = level.getRainLevel(partialTick);
+
+        float lightR = Mth.lerp(day, 0.24f, 1.00f) + sunset * 0.14f;
+        float lightG = Mth.lerp(day, 0.28f, 0.99f) + sunset * 0.04f;
+        float lightB = Mth.lerp(day, 0.38f, 0.98f) - sunset * 0.08f;
+        float rainDim = 1.0f - rain * 0.22f;
+        lightR *= rainDim;
+        lightG *= rainDim;
+        lightB *= rainDim;
+
+        float[] fogColor = RenderSystem.getShaderFogColor();
+        float fogStart = RenderSystem.getShaderFogStart();
+        float fogEnd = RenderSystem.getShaderFogEnd();
+        float clipDist = Math.max(16.0f, (SeedHorizonConfig.getRealRenderDistanceCap() - 1.5f) * 16.0f);
 
         RenderSystem.enableDepthTest();
         RenderSystem.depthMask(true);
         RenderSystem.enableCull();
         RenderSystem.disableBlend();
-        RenderSystem.setShaderColor(1.0f, 1.0f, 1.0f, 1.0f);
+
+        int prevProgram = GL20.glGetInteger(GL20.GL_CURRENT_PROGRAM);
+        GL20.glUseProgram(LOD_SHADER.getProgramId());
+
+        // Bind Minecraft's depth buffer to texture unit 0 and live BLOCK_ATLAS to unit 1
+        GL13.glActiveTexture(GL13.GL_TEXTURE0);
+        GL11.glBindTexture(GL11.GL_TEXTURE_2D, mainTarget.getDepthTextureId());
+        GL20.glUniform1i(LOD_SHADER.getMcDepthLoc(), 0);
+
+        GL13.glActiveTexture(GL13.GL_TEXTURE1);
+        GL11.glBindTexture(GL11.GL_TEXTURE_2D, LodAtlasSprites.getBlockAtlasTextureId());
+        GL20.glUniform1i(LOD_SHADER.getBlockAtlasLoc(), 1);
+        GL13.glActiveTexture(GL13.GL_TEXTURE0);
+        GL20.glUniform2f(LOD_SHADER.getScreenSizeLoc(), (float) viewW, (float) viewH);
+        GL20.glUniform1f(LOD_SHADER.getClipDistanceLoc(), clipDist);
+
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            FloatBuffer mvBuf = stack.mallocFloat(16);
+            FloatBuffer pBuf = stack.mallocFloat(16);
+            modelView.get(mvBuf);
+            projection.get(pBuf);
+            GL20.glUniformMatrix4fv(LOD_SHADER.getModelViewMatLoc(), false, mvBuf);
+            GL20.glUniformMatrix4fv(LOD_SHADER.getProjMatLoc(), false, pBuf);
+        }
+
+        GL20.glUniform1f(LOD_SHADER.getFogStartLoc(), fogStart);
+        GL20.glUniform1f(LOD_SHADER.getFogEndLoc(), fogEnd);
+        GL20.glUniform4f(LOD_SHADER.getFogColorLoc(), fogColor[0], fogColor[1], fogColor[2], fogColor[3]);
+        GL20.glUniform3f(LOD_SHADER.getLightTintLoc(), lightR, lightG, lightB);
+
+        int playerChunkX = mc.player.chunkPosition().x;
+        int playerChunkZ = mc.player.chunkPosition().z;
+        int innerSkipSq = Math.max(1, SeedHorizonConfig.getRealRenderDistanceCap() - 3);
+        innerSkipSq = innerSkipSq * innerSkipSq;
 
         for (LodSection sec : SECTIONS.values()) {
             VertexBuffer vbo = sec.getVertexBuffer();
@@ -236,10 +288,9 @@ public final class LodRenderHandler {
                 continue;
             }
 
-            int secCenterChunkX = sec.getSectionX() * LodSection.SIZE_CHUNKS + 1;
-            int secCenterChunkZ = sec.getSectionZ() * LodSection.SIZE_CHUNKS + 1;
-            if (Math.abs(secCenterChunkX - playerChunkX) < skipRealInnerChunks
-                    && Math.abs(secCenterChunkZ - playerChunkZ) < skipRealInnerChunks) {
+            int dcx = sec.getChunkX() - playerChunkX;
+            int dcz = sec.getChunkZ() - playerChunkZ;
+            if (dcx * dcx + dcz * dcz < innerSkipSq) {
                 continue;
             }
 
@@ -248,11 +299,11 @@ public final class LodRenderHandler {
             }
 
             vbo.bind();
-            vbo.drawWithShader(modelView, projection, shader);
+            vbo.draw();
         }
 
         VertexBuffer.unbind();
-        poseStack.popPose();
+        GL20.glUseProgram(prevProgram);
     }
 
     @SubscribeEvent
@@ -263,7 +314,7 @@ public final class LodRenderHandler {
         String compat = SodiumCompat.isSodiumLoaded() ? "Sodium"
                 : (SodiumCompat.isEmbeddiumLoaded() ? "Embeddium" : "Vanilla");
         event.getLeft().add(String.format(
-                "[SeedHorizon] LOD: %dch | Real Cap: %dch | Sections: %d | Renderer: %s",
+                "[SeedHorizon] LOD: %dch | Real Cap: %dch | Chunks: %d | Renderer: %s",
                 SeedHorizonConfig.getLodRenderDistance(),
                 SeedHorizonConfig.getRealRenderDistanceCap(),
                 SECTIONS.size(),
@@ -276,7 +327,7 @@ public final class LodRenderHandler {
                 Commands.literal("seedhorizon")
                         .then(Commands.literal("status").executes(ctx -> {
                             ctx.getSource().sendSuccess(() -> Component.literal(String.format(
-                                    "SeedHorizon active=%s, LOD=%d chunks, RealCap=%d chunks, Sections=%d, Sodium=%s",
+                                    "SeedHorizon active=%s, LOD=%d chunks, RealCap=%d chunks, Chunks=%d, Sodium=%s",
                                     SeedHorizonConfig.isActive(),
                                     SeedHorizonConfig.getLodRenderDistance(),
                                     SeedHorizonConfig.getRealRenderDistanceCap(),
