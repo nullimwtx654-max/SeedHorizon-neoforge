@@ -1,0 +1,10 @@
+[package]
+name = "potato_horizon"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Ultra-lightweight 6-to-16 chunk Distant-Horizons-style LOD native mod for Horizon (Minecraft 26.3 in Rust), engineered for low-end PCs."
+
+[lib]
+name = "potato_horizon"
+path = "mixins/potato_horizon/runtime.rs"

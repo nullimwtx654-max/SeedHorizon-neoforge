@@ -1,0 +1,8 @@
+{
+  "mod_id": "potato_horizon",
+  "version": "0.1.0",
+  "hooks": 1,
+  "horizon_revision": "d009ebd",
+  "horizon_mixins_revision": "d9c83d7",
+  "notes": "Hooks Horizon's stable native hook points plus Game::terrain_distance (RETURN) to push fog and far-plane out to the 16-chunk LOD horizon. Re-pin horizon_revision in compatibility.json and bridge.rs when targeting a newer Horizon Nightly."
+}

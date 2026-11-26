@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>BlockCraft — voxel sandbox</title>
+<link rel="stylesheet" href="css/style.css">
+<script type="importmap">{ "imports": { "three": "./vendor/three.module.js" } }</script>
+</head>
+<body>
+<canvas id="game-canvas"></canvas>
+
+<!-- fullscreen tint overlays -->
+<div id="damage-flash"></div>
+<div id="water-overlay"></div>
+<div id="lava-overlay"></div>
+
+<!-- in-game HUD -->
+<div id="hud" class="hidden">
+  <div id="crosshair"><div id="break-progress"></div></div>
+  <div id="hotbar"></div>
+  <div id="status-bars">
+    <div id="hearts" class="bar"></div>
+    <div id="hunger" class="bar"></div>
+  </div>
+  <div id="top-bar">
+    <span id="time-indicator" title="Time of day">☀</span>
+    <span id="coords"></span>
+    <span id="fps"></span>
+  </div>
+  <div id="toast" class="hidden"></div>
+</div>
+
+<!-- touch controls -->
+<div id="touch-controls" class="hidden">
+  <div id="joystick"><div id="joystick-knob"></div></div>
+  <div id="touch-buttons">
+    <button class="tbtn" id="btn-jump">⤒</button>
+    <button class="tbtn" id="btn-break">⛏</button>
+    <button class="tbtn" id="btn-place">▣</button>
+    <button class="tbtn" id="btn-inv">🎒</button>
+  </div>
+</div>
+
+<!-- title screen -->
+<div id="screen-title" class="screen">
+  <div class="panel title-panel">
+    <h1 class="logo">BLOCK<span>CRAFT</span></h1>
+    <p class="tagline">A voxel sandbox — mine, craft, survive.</p>
+    <div id="world-list"></div>
+    <div class="row">
+      <input id="new-world-name" maxlength="24" placeholder="World name" value="New World">
+      <input id="new-world-seed" maxlength="18" placeholder="Seed (optional)">
+      <button class="btn primary" id="btn-create">Create</button>
+    </div>
+    <div class="row">
+      <button class="btn" id="btn-import-title">Import world…</button>
+      <button class="btn" id="btn-howto">How to play</button>
+    </div>
+    <p class="foot">Saves are stored locally · use Export/Import to move a world between devices or game versions (old saves are migrated automatically).</p>
+  </div>
+</div>
+
+<!-- pause screen -->
+<div id="screen-pause" class="screen hidden">
+  <div class="panel">
+    <h2>Paused</h2>
+    <button class="btn primary wide" id="btn-resume">Back to game</button>
+    <button class="btn wide" id="btn-pause-save">Save &amp; quit to title</button>
+    <button class="btn wide" id="btn-pause-export">Export world (JSON)…</button>
+    <div class="settings">
+      <label>Render distance <input type="range" id="set-render" min="3" max="8" step="1" value="5"><span id="set-render-val">5</span></label>
+      <label>Field of view <input type="range" id="set-fov" min="60" max="110" step="5" value="75"><span id="set-fov-val">75</span></label>
+      <label>Mouse sensitivity <input type="range" id="set-sens" min="20" max="200" step="10" value="100"><span id="set-sens-val">100%</span></label>
+      <label class="check"><input type="checkbox" id="set-invert"> Invert Y</label>
+    </div>
+    <button class="btn wide" id="btn-howto-2">How to play</button>
+  </div>
+</div>
+
+<!-- inventory / crafting screen -->
+<div id="screen-inventory" class="screen hidden">
+  <div class="panel inv-panel">
+    <h2>Inventory &amp; Crafting</h2>
+    <div class="craft-area">
+      <div id="craft-grid" class="slot-grid three"></div>
+      <div class="craft-arrow">➜</div>
+      <div id="craft-result" class="slot big"></div>
+    </div>
+    <div id="inv-grid" class="slot-grid nine"></div>
+    <div id="inv-hotbar" class="slot-grid nine"></div>
+    <p class="hint">Click a slot to pick up / put down items · right-click places one · recipes up to 3×3</p>
+  </div>
+</div>
+
+<!-- furnace screen -->
+<div id="screen-furnace" class="screen hidden">
+  <div class="panel">
+    <h2>Furnace</h2>
+    <div class="furnace-area">
+      <div id="furnace-input" class="slot big"></div>
+      <div class="furnace-mid">
+        <div id="furnace-flame">🔥</div>
+        <div id="furnace-arrow">➜</div>
+      </div>
+      <div id="furnace-output" class="slot big"></div>
+    </div>
+    <div id="furnace-fuel-row"><span>Fuel:</span> <div id="furnace-fuel" class="slot big"></div></div>
+    <p class="hint">Ore → ingot · sand → glass · meat → cooked · clay ball → brick · 10s per item · coal/charcoal smelts 8</p>
+  </div>
+</div>
+
+<!-- death screen -->
+<div id="screen-death" class="screen hidden">
+  <div class="panel">
+    <h2 class="death-title">You died!</h2>
+    <p id="death-cause"></p>
+    <button class="btn primary wide" id="btn-respawn">Respawn</button>
+  </div>
+</div>
+
+<!-- generic modal (export / import / help) -->
+<div id="modal" class="screen hidden">
+  <div class="panel modal-panel">
+    <h2 id="modal-title">Modal</h2>
+    <div id="modal-body"></div>
+    <div class="row" id="modal-buttons"></div>
+  </div>
+</div>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
