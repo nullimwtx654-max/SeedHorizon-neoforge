@@ -16,8 +16,17 @@ jobs:
         with:
           gradle-version: 8.10.2
       - name: Build JAR
-        run: gradle build --no-daemon
+        run: |
+          for z in *-src.zip; do
+            [ -f "$z" ] && unzip -q -o "$z"
+          done
+          PROJECT_DIR=$(dirname "$(find . -maxdepth 3 -name 'build.gradle' | head -n 1)")
+          echo "Building in $PROJECT_DIR"
+          cd "$PROJECT_DIR"
+          gradle build --no-daemon
+          mkdir -p "$GITHUB_WORKSPACE/out-jars"
+          cp build/libs/*.jar "$GITHUB_WORKSPACE/out-jars/"
       - uses: actions/upload-artifact@v4
         with:
           name: mod-jar
-          path: build/libs/*.jar
+          path: out-jars/*.jar
