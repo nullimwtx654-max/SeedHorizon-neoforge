@@ -5,10 +5,13 @@ import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL20;
 
 /**
- * Distant-Horizons-3.3-style textured GLSL 330 LOD shader:
- * samples Minecraft's live {@code BLOCK_ATLAS} ({@code u_BlockAtlas}) tinted by biome color,
- * performs pixel-exact vanilla depth occlusion ({@code u_McDepth}) + 4x4 Bayer dither border fade,
- * and blends smoothly into exponential-squared horizon fog.
+ * Distant-Horizons-3.3-inspired textured GLSL 330 LOD shader:
+ * <ul>
+ *   <li>Samples Minecraft's live {@code BLOCK_ATLAS} tinted by biome & valley AO.</li>
+ *   <li>Supports both opaque terrain and translucent water passes.</li>
+ *   <li>Implements Distant Horizons' {@code fog.frag} exponential-squared distance fog
+ *       combined with valley height fog ({@code INVERSE_MULTIPLY}) for natural depth.</li>
+ * </ul>
  */
 public final class LodShader {
     private static final String VERT_SRC = """
@@ -22,9 +25,11 @@ public final class LodShader {
 
             out vec2 vUv;
             out vec4 vColor;
+            out float vWorldY;
             out float vDist;
 
             void main() {
+                vWorldY = Position.y;
                 vec4 viewPos = u_ModelViewMat * vec4(Position, 1.0);
                 gl_Position = u_ProjMat * viewPos;
                 vUv = UV0;
@@ -37,16 +42,16 @@ public final class LodShader {
             #version 330 core
             in vec2 vUv;
             in vec4 vColor;
+            in float vWorldY;
             in float vDist;
 
-            uniform sampler2D u_McDepth;
             uniform sampler2D u_BlockAtlas;
-            uniform vec2 u_ScreenSize;
             uniform float u_ClipDistance;
             uniform float u_FogStart;
             uniform float u_FogEnd;
             uniform vec4 u_FogColor;
             uniform vec3 u_LightTint;
+            uniform float u_SeaLevel;
 
             out vec4 fragColor;
 
@@ -63,47 +68,47 @@ public final class LodShader {
             }
 
             void main() {
-                // 1. Pixel-exact vanilla/Sodium depth occlusion
-                vec2 screenUv = gl_FragCoord.xy / u_ScreenSize;
-                float mcDepth = texture(u_McDepth, screenUv).r;
-                if (mcDepth < 0.9999) {
-                    discard;
-                }
-
-                // 2. Smooth 4x4 Bayer dithered near-border transition
-                if (u_ClipDistance > 0.0 && vDist < u_ClipDistance * 1.12) {
-                    float fade = smoothstep(u_ClipDistance * 0.70, u_ClipDistance * 1.12, vDist);
+                // Smooth 4x4 Bayer dithered near-border clip
+                if (u_ClipDistance > 0.0 && vDist < u_ClipDistance * 1.10) {
+                    float fade = smoothstep(u_ClipDistance * 0.72, u_ClipDistance * 1.10, vDist);
                     if (fade <= bayer4x4(gl_FragCoord.xy)) {
                         discard;
                     }
                 }
 
-                // 3. Real Minecraft block texture tinted by biome & AO/slope color
+                // Real Minecraft block texture tinted by biome & AO/slope color
                 vec4 texel = texture(u_BlockAtlas, vUv);
                 vec3 rgb = texel.rgb * vColor.rgb * u_LightTint;
 
-                // 4. Exponential-squared horizon fog
+                // Distant Horizons style Exponential-Squared far fog
                 float fogSpan = max(u_FogEnd - u_FogStart, 16.0);
-                float t = clamp((vDist - u_FogStart) / fogSpan, 0.0, 1.0);
-                float fogFactor = clamp(1.0 - exp(-2.4 * t * t), 0.0, 1.0);
-                fogFactor = max(fogFactor, smoothstep(0.88, 1.0, t));
+                float tFar = clamp((vDist - u_FogStart) / fogSpan, 0.0, 1.0);
+                float farFog = clamp(1.0 - exp(-2.4 * tFar * tFar), 0.0, 1.0);
+                farFog = max(farFog, smoothstep(0.88, 1.0, tFar));
 
-                rgb = mix(rgb, u_FogColor.rgb, fogFactor);
-                fragColor = vec4(rgb, 1.0);
+                // Subtle Distant Horizons style valley height fog (softens distant valleys while peaks stay crisp)
+                float distWeight = smoothstep(96.0, 320.0, vDist);
+                float heightBelowMist = clamp((u_SeaLevel + 28.0 - vWorldY) / 48.0, 0.0, 1.0);
+                float heightFog = heightBelowMist * heightBelowMist * 0.24 * distWeight;
+
+                // DH INVERSE_MULTIPLY fog mixing
+                float totalFog = clamp(1.0 - (1.0 - farFog) * (1.0 - heightFog), 0.0, 1.0);
+
+                rgb = mix(rgb, u_FogColor.rgb, totalFog);
+                fragColor = vec4(rgb, vColor.a);
             }
             """;
 
     private int programId = 0;
     private int uModelViewMat = -1;
     private int uProjMat = -1;
-    private int uMcDepth = -1;
     private int uBlockAtlas = -1;
-    private int uScreenSize = -1;
     private int uClipDistance = -1;
     private int uFogStart = -1;
     private int uFogEnd = -1;
     private int uFogColor = -1;
     private int uLightTint = -1;
+    private int uSeaLevel = -1;
 
     public boolean ensureInitialized() {
         if (programId != 0) {
@@ -127,14 +132,13 @@ public final class LodShader {
         programId = prog;
         uModelViewMat = GL20.glGetUniformLocation(prog, "u_ModelViewMat");
         uProjMat = GL20.glGetUniformLocation(prog, "u_ProjMat");
-        uMcDepth = GL20.glGetUniformLocation(prog, "u_McDepth");
         uBlockAtlas = GL20.glGetUniformLocation(prog, "u_BlockAtlas");
-        uScreenSize = GL20.glGetUniformLocation(prog, "u_ScreenSize");
         uClipDistance = GL20.glGetUniformLocation(prog, "u_ClipDistance");
         uFogStart = GL20.glGetUniformLocation(prog, "u_FogStart");
         uFogEnd = GL20.glGetUniformLocation(prog, "u_FogEnd");
         uFogColor = GL20.glGetUniformLocation(prog, "u_FogColor");
         uLightTint = GL20.glGetUniformLocation(prog, "u_LightTint");
+        uSeaLevel = GL20.glGetUniformLocation(prog, "u_SeaLevel");
         return true;
     }
 
@@ -151,14 +155,13 @@ public final class LodShader {
     public int getProgramId() { return programId; }
     public int getModelViewMatLoc() { return uModelViewMat; }
     public int getProjMatLoc() { return uProjMat; }
-    public int getMcDepthLoc() { return uMcDepth; }
     public int getBlockAtlasLoc() { return uBlockAtlas; }
-    public int getScreenSizeLoc() { return uScreenSize; }
     public int getClipDistanceLoc() { return uClipDistance; }
     public int getFogStartLoc() { return uFogStart; }
     public int getFogEndLoc() { return uFogEnd; }
     public int getFogColorLoc() { return uFogColor; }
     public int getLightTintLoc() { return uLightTint; }
+    public int getSeaLevelLoc() { return uSeaLevel; }
 
     public void destroy() {
         if (programId != 0) {

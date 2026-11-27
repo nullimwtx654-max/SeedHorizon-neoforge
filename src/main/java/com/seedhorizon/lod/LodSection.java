@@ -15,19 +15,21 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * A 1x1-chunk (16x16 block) textured LOD section using {@link DefaultVertexFormat#POSITION_TEX_COLOR}
- * mapped directly onto Minecraft's live {@code BLOCK_ATLAS} textures, with neighbor-culled layered cliffs,
- * valley AO, and multi-tier textured 3D trees.
+ * A 1x1-chunk (16x16 block) Distant-Horizons-style LOD section with:
+ * <ul>
+ *   <li>Separate opaque terrain VBO (including real underwater sand/gravel seabed) and
+ *       translucent water VBO ({@code alpha = 185}) with DH-style 2D greedy quad merging.</li>
+ *   <li>Neighbor-culled layered cliffs (grass -> dirt -> stone) and valley Ambient Occlusion.</li>
+ *   <li>Organic multi-voxel 3D tree silhouettes via {@link LodTreeShapes}.</li>
+ * </ul>
  */
 public final class LodSection implements AutoCloseable {
     public static final int SIZE_CHUNKS = 1;
     public static final int SIZE_BLOCKS = 16;
 
     private record TreeInstance(float cx, float groundY, float cz, SurfaceColorResolver.TreeStyle style,
-                                int trunkH, int canopyH,
-                                LodAtlasSprites.Material trunkMat,
-                                LodAtlasSprites.Material leafMat,
-                                int leafTint) {
+                                int seedHash, LodAtlasSprites.Material trunkMat,
+                                LodAtlasSprites.Material leafMat, int leafTint) {
     }
 
     private final int chunkX;
@@ -35,51 +37,73 @@ public final class LodSection implements AutoCloseable {
     private final int stepBlocks;
     private final int gridWidth;
     private final int extW;
-    private final int[] renderYs;
+    private final int[] solidYs;
+    private final boolean[] isWaterGrid;
+    private final int[] waterTints;
     private final SurfaceColorResolver.ColumnPalette[] palettes;
     private final boolean[] valid;
     private final List<TreeInstance> trees;
     private final int seaLevel;
     private final AABB bounds;
+    private final boolean realSnapshot;
 
     @Nullable
-    private VertexBuffer vertexBuffer;
-    private final boolean realSnapshot;
+    private VertexBuffer opaqueVbo;
+    @Nullable
+    private VertexBuffer waterVbo;
     private volatile boolean uploaded = false;
     private volatile boolean closed = false;
 
     private LodSection(int chunkX, int chunkZ, int stepBlocks, int gridWidth, int extW,
-                       int[] renderYs, SurfaceColorResolver.ColumnPalette[] palettes,
+                       int[] solidYs, boolean[] isWaterGrid, int[] waterTints,
+                       SurfaceColorResolver.ColumnPalette[] palettes,
                        boolean[] valid, List<TreeInstance> trees, int seaLevel, int minY, int maxY) {
         this.chunkX = chunkX;
         this.chunkZ = chunkZ;
         this.stepBlocks = stepBlocks;
         this.gridWidth = gridWidth;
         this.extW = extW;
-        this.renderYs = renderYs;
+        this.solidYs = solidYs;
+        this.isWaterGrid = isWaterGrid;
+        this.waterTints = waterTints;
         this.palettes = palettes;
         this.valid = valid;
         this.trees = trees;
         this.seaLevel = seaLevel;
+        this.realSnapshot = false;
 
         int worldX = chunkX * SIZE_BLOCKS;
         int worldZ = chunkZ * SIZE_BLOCKS;
         this.bounds = new AABB(worldX, minY, worldZ, worldX + SIZE_BLOCKS, maxY, worldZ + SIZE_BLOCKS);
-        this.realSnapshot = false;
     }
 
     private LodSection(int chunkX, int chunkZ, AABB bounds, VertexBuffer vbo, boolean realSnapshot) {
-        this.chunkX = chunkX; this.chunkZ = chunkZ; this.stepBlocks = 1; this.gridWidth = 16; this.extW = 18;
-        this.renderYs = new int[0]; this.palettes = new SurfaceColorResolver.ColumnPalette[0];
-        this.valid = new boolean[0]; this.trees = List.of(); this.seaLevel = 63;
-        this.bounds = bounds; this.vertexBuffer = vbo; this.realSnapshot = realSnapshot; this.uploaded = true;
+        this.chunkX = chunkX;
+        this.chunkZ = chunkZ;
+        this.stepBlocks = 1;
+        this.gridWidth = 16;
+        this.extW = 18;
+        this.solidYs = new int[0];
+        this.isWaterGrid = new boolean[0];
+        this.waterTints = new int[0];
+        this.palettes = new SurfaceColorResolver.ColumnPalette[0];
+        this.valid = new boolean[0];
+        this.trees = List.of();
+        this.seaLevel = 63;
+        this.bounds = bounds;
+        this.opaqueVbo = vbo;
+        this.waterVbo = null;
+        this.realSnapshot = realSnapshot;
+        this.uploaded = true;
     }
 
     public static LodSection fromPrebuiltVbo(int chunkX, int chunkZ, AABB bounds, VertexBuffer vbo, boolean realSnapshot) {
         return new LodSection(chunkX, chunkZ, bounds, vbo, realSnapshot);
     }
 
-    public boolean isRealSnapshot() { return realSnapshot; }
+    public boolean isRealSnapshot() {
+        return realSnapshot;
+    }
 
     public static LodSection generate(SeedStateManager.SeedContext ctx, int chunkX, int chunkZ, int stepBlocks) {
         int gridWidth = Math.max(1, SIZE_BLOCKS / stepBlocks);
@@ -97,16 +121,19 @@ public final class LodSection implements AutoCloseable {
             }
         }
 
-        int[] renderYs = new int[extW * extW];
+        int[] solidYs = new int[extW * extW];
         boolean[] valid = new boolean[extW * extW];
         for (int i = 0; i < samples.length; i++) {
             if (samples[i].valid()) {
                 valid[i] = true;
-                renderYs[i] = samples[i].renderY();
+                solidYs[i] = samples[i].surfaceY();
             }
         }
 
-        SurfaceColorResolver.ColumnPalette[] palettes = new SurfaceColorResolver.ColumnPalette[gridWidth * gridWidth];
+        int count = gridWidth * gridWidth;
+        SurfaceColorResolver.ColumnPalette[] palettes = new SurfaceColorResolver.ColumnPalette[count];
+        boolean[] isWaterGrid = new boolean[count];
+        int[] waterTints = new int[count];
         List<TreeInstance> trees = new ArrayList<>();
 
         boolean treesEnabled = SeedHorizonConfig.CLIENT.enableLodTrees.get() && stepBlocks <= 4;
@@ -125,14 +152,14 @@ public final class LodSection implements AutoCloseable {
                     continue;
                 }
 
-                int y = col.renderY();
+                int y = col.surfaceY();
                 if (y < minY) minY = y;
-                if (y > maxY) maxY = y;
+                if (col.renderY() > maxY) maxY = col.renderY();
 
-                int hW = valid[sz * extW + (sx - 1)] ? renderYs[sz * extW + (sx - 1)] : y;
-                int hE = valid[sz * extW + (sx + 1)] ? renderYs[sz * extW + (sx + 1)] : y;
-                int hN = valid[(sz - 1) * extW + sx] ? renderYs[(sz - 1) * extW + sx] : y;
-                int hS = valid[(sz + 1) * extW + sx] ? renderYs[(sz + 1) * extW + sx] : y;
+                int hW = valid[sz * extW + (sx - 1)] ? solidYs[sz * extW + (sx - 1)] : y;
+                int hE = valid[sz * extW + (sx + 1)] ? solidYs[sz * extW + (sx + 1)] : y;
+                int hN = valid[(sz - 1) * extW + sx] ? solidYs[(sz - 1) * extW + sx] : y;
+                int hS = valid[(sz + 1) * extW + sx] ? solidYs[(sz + 1) * extW + sx] : y;
 
                 float dx = (hW - hE);
                 float dy = 2.0f * stepBlocks;
@@ -148,9 +175,25 @@ public final class LodSection implements AutoCloseable {
 
                 int wx = baseX + gx * stepBlocks + (stepBlocks >> 1);
                 int wz = baseZ + gz * stepBlocks + (stepBlocks >> 1);
-                palettes[idx] = SurfaceColorResolver.resolvePalette(
-                        col.biome(), wx, col.surfaceY(), wz, col.seaLevel(),
-                        col.isWater(), col.waterDepth(), ny, sunDot, col.isNether(), col.isEnd());
+
+                if (col.isWater()) {
+                    isWaterGrid[idx] = true;
+                    // Opaque underwater seabed (sand in shallows, gravel in deep ocean)
+                    LodAtlasSprites.Material bedMat = (col.waterDepth() > 12)
+                            ? LodAtlasSprites.Material.GRAVEL : LodAtlasSprites.Material.SAND;
+                    float bedShade = Mth.clamp(0.88f - col.waterDepth() * 0.025f, 0.35f, 0.88f) * sunDot;
+                    int bedTint = SurfaceColorResolver.applyShade(0xFFFFFFFF, bedShade);
+                    palettes[idx] = new SurfaceColorResolver.ColumnPalette(
+                            bedMat, bedTint, bedMat, bedTint, LodAtlasSprites.Material.STONE, bedTint);
+
+                    int wRgb = col.biome().value().getWaterColor();
+                    int wAlpha = Mth.clamp(165 + col.waterDepth() * 3, 165, 225);
+                    waterTints[idx] = (wAlpha << 24) | (wRgb & 0x00FFFFFF);
+                } else {
+                    palettes[idx] = SurfaceColorResolver.resolvePalette(
+                            col.biome(), wx, y, wz, col.seaLevel(),
+                            false, 0, ny, sunDot, col.isNether(), col.isEnd());
+                }
 
                 if (treesEnabled && !col.isWater() && !col.isNether() && !col.isEnd() && ny > 0.74f) {
                     boolean onTreeGrid = (stepBlocks == 1) ? ((gx & 3) == 1 && (gz & 3) == 1)
@@ -165,24 +208,14 @@ public final class LodSection implements AutoCloseable {
                                 default -> 7;
                             };
                             if ((th & chanceMask) == 0) {
-                                int trunkH = switch (style) {
-                                    case SPRUCE -> 2 + ((th >> 4) & 1);
-                                    case JUNGLE -> 4 + ((th >> 4) & 3);
-                                    default -> 2 + ((th >> 4) & 1);
-                                };
-                                int canopyH = switch (style) {
-                                    case SPRUCE -> 5 + ((th >> 6) & 3);
-                                    case JUNGLE -> 4 + ((th >> 6) & 2);
-                                    default -> 3 + ((th >> 6) & 1);
-                                };
                                 int leafTint = SurfaceColorResolver.resolveTreeCanopyTint(col.biome(), style, wx, wz);
                                 float cx = baseX + gx * stepBlocks + stepBlocks * 0.5f;
                                 float cz = baseZ + gz * stepBlocks + stepBlocks * 0.5f;
-                                trees.add(new TreeInstance(cx, y + 0.94f, cz, style, trunkH, canopyH,
+                                trees.add(new TreeInstance(cx, y + 0.94f, cz, style, th,
                                         SurfaceColorResolver.getTrunkMaterial(style),
                                         SurfaceColorResolver.getLeafMaterial(style), leafTint));
-                                if (y + trunkH + canopyH + 2 > maxY) {
-                                    maxY = y + trunkH + canopyH + 2;
+                                if (y + 12 > maxY) {
+                                    maxY = y + 12;
                                 }
                             }
                         }
@@ -196,11 +229,11 @@ public final class LodSection implements AutoCloseable {
             maxY = 64;
         }
         return new LodSection(chunkX, chunkZ, stepBlocks, gridWidth, extW,
-                renderYs, palettes, valid, trees, seaLevel, minY - 32, maxY + 4);
+                solidYs, isWaterGrid, waterTints, palettes, valid, trees, seaLevel, minY - 32, maxY + 4);
     }
 
     /**
-     * Must be called on the render thread so {@link LodAtlasSprites} can query the live block atlas.
+     * Builds both opaque terrain (with greedy flat-quad merging) and translucent water VBOs on the render thread.
      */
     public void uploadToGpu() {
         if (closed || uploaded) {
@@ -211,41 +244,83 @@ public final class LodSection implements AutoCloseable {
         int baseZ = chunkZ * SIZE_BLOCKS;
         float deepFloor = seaLevel - 32.0f;
 
-        try (ByteBufferBuilder byteBuffer = new ByteBufferBuilder(20480)) {
+        // 1. Opaque terrain + seabed + organic 3D trees
+        try (ByteBufferBuilder byteBuffer = new ByteBufferBuilder(24576)) {
             BufferBuilder builder = new BufferBuilder(byteBuffer, VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_TEX_COLOR);
-            boolean hasGeometry = false;
+            boolean hasOpaque = false;
 
+            // DH-style 2D greedy merge for flat identical top faces
+            boolean[] mergedTop = new boolean[gridWidth * gridWidth];
             for (int gz = 0; gz < gridWidth; gz++) {
                 for (int gx = 0; gx < gridWidth; gx++) {
                     int idx = gz * gridWidth + gx;
-                    int sx = gx + 1;
-                    int sz = gz + 1;
-                    int eIdx = sz * extW + sx;
-                    if (!valid[eIdx] || palettes[idx] == null) {
-                        continue;
-                    }
-                    hasGeometry = true;
+                    int eIdx = (gz + 1) * extW + (gx + 1);
+                    if (!valid[eIdx] || palettes[idx] == null) continue;
+                    hasOpaque = true;
 
+                    if (!mergedTop[idx]) {
+                        int yRef = solidYs[eIdx];
+                        SurfaceColorResolver.ColumnPalette pRef = palettes[idx];
+                        int runW = 1;
+                        while (gx + runW < gridWidth) {
+                            int nIdx = gz * gridWidth + (gx + runW);
+                            int neIdx = (gz + 1) * extW + (gx + runW + 1);
+                            if (mergedTop[nIdx] || !valid[neIdx] || solidYs[neIdx] != yRef
+                                    || palettes[nIdx] == null
+                                    || palettes[nIdx].topMat() != pRef.topMat()
+                                    || palettes[nIdx].topTint() != pRef.topTint()) {
+                                break;
+                            }
+                            runW++;
+                        }
+                        int runH = 1;
+                        outer:
+                        while (gz + runH < gridWidth) {
+                            for (int rx = 0; rx < runW; rx++) {
+                                int nIdx = (gz + runH) * gridWidth + (gx + rx);
+                                int neIdx = (gz + runH + 1) * extW + (gx + rx + 1);
+                                if (mergedTop[nIdx] || !valid[neIdx] || solidYs[neIdx] != yRef
+                                        || palettes[nIdx] == null
+                                        || palettes[nIdx].topMat() != pRef.topMat()
+                                        || palettes[nIdx].topTint() != pRef.topTint()) {
+                                    break outer;
+                                }
+                            }
+                            runH++;
+                        }
+                        for (int rz = 0; rz < runH; rz++) {
+                            for (int rx = 0; rx < runW; rx++) {
+                                mergedTop[(gz + rz) * gridWidth + (gx + rx)] = true;
+                            }
+                        }
+
+                        float x0 = baseX + gx * stepBlocks;
+                        float z0 = baseZ + gz * stepBlocks;
+                        float x1 = x0 + runW * stepBlocks;
+                        float z1 = z0 + runH * stepBlocks;
+                        LodAtlasSprites.SpriteUv topUv = LodAtlasSprites.getUv(pRef.topMat());
+                        emitTopFace(builder, x0, yRef + 0.94f, z0, x1, z1, topUv, pRef.topTint());
+                    }
+
+                    // Neighbor-culled layered cliff sides
                     float x0 = baseX + gx * stepBlocks;
                     float z0 = baseZ + gz * stepBlocks;
                     float x1 = x0 + stepBlocks;
                     float z1 = z0 + stepBlocks;
-                    float yTop = renderYs[eIdx] + 0.94f;
+                    float yTop = solidYs[eIdx] + 0.94f;
+                    int sx = gx + 1, sz = gz + 1;
 
-                    SurfaceColorResolver.ColumnPalette pal = palettes[idx];
-                    LodAtlasSprites.SpriteUv topUv = LodAtlasSprites.getUv(pal.topMat());
-                    emitTopFace(builder, x0, yTop, z0, x1, z1, topUv, pal.topTint());
-
-                    float yN = valid[(sz - 1) * extW + sx] ? (renderYs[(sz - 1) * extW + sx] + 0.94f) : deepFloor;
-                    float yS = valid[(sz + 1) * extW + sx] ? (renderYs[(sz + 1) * extW + sx] + 0.94f) : deepFloor;
-                    float yW = valid[sz * extW + (sx - 1)] ? (renderYs[sz * extW + (sx - 1)] + 0.94f) : deepFloor;
-                    float yE = valid[sz * extW + (sx + 1)] ? (renderYs[sz * extW + (sx + 1)] + 0.94f) : deepFloor;
+                    float yN = valid[(sz - 1) * extW + sx] ? (solidYs[(sz - 1) * extW + sx] + 0.94f) : deepFloor;
+                    float yS = valid[(sz + 1) * extW + sx] ? (solidYs[(sz + 1) * extW + sx] + 0.94f) : deepFloor;
+                    float yW = valid[sz * extW + (sx - 1)] ? (solidYs[sz * extW + (sx - 1)] + 0.94f) : deepFloor;
+                    float yE = valid[sz * extW + (sx + 1)] ? (solidYs[sz * extW + (sx + 1)] + 0.94f) : deepFloor;
 
                     if (gz == 0) yN = Math.min(yN, yTop - 3.0f);
                     if (gz == gridWidth - 1) yS = Math.min(yS, yTop - 3.0f);
                     if (gx == 0) yW = Math.min(yW, yTop - 3.0f);
                     if (gx == gridWidth - 1) yE = Math.min(yE, yTop - 3.0f);
 
+                    SurfaceColorResolver.ColumnPalette pal = palettes[idx];
                     LodAtlasSprites.SpriteUv fillUv = LodAtlasSprites.getUv(pal.fillerMat());
                     LodAtlasSprites.SpriteUv stoneUv = LodAtlasSprites.getUv(pal.stoneMat());
 
@@ -256,52 +331,80 @@ public final class LodSection implements AutoCloseable {
                 }
             }
 
-            // Textured multi-tier 3D trees
+            // Organic multi-voxel 3D trees
             for (TreeInstance t : trees) {
-                hasGeometry = true;
-                LodAtlasSprites.SpriteUv trunkUv = LodAtlasSprites.getUv(t.trunkMat());
-                LodAtlasSprites.SpriteUv leafUv = LodAtlasSprites.getUv(t.leafMat());
-                float tr = Math.max(0.45f, stepBlocks * 0.28f);
-                float trunkTop = t.groundY + t.trunkH;
-                emitBox(builder, t.cx - tr, t.groundY, t.cz - tr, t.cx + tr, trunkTop + 0.5f, t.cz + tr, trunkUv, 0xFFFFFFFF);
-
-                if (t.style == SurfaceColorResolver.TreeStyle.SPRUCE) {
-                    float r1 = Math.max(1.8f, stepBlocks * 0.9f);
-                    float r2 = Math.max(1.2f, stepBlocks * 0.6f);
-                    float r3 = Math.max(0.6f, stepBlocks * 0.3f);
-                    float h1 = t.canopyH * 0.42f;
-                    float h2 = t.canopyH * 0.34f;
-                    float h3 = t.canopyH * 0.24f;
-                    emitBox(builder, t.cx - r1, trunkTop, t.cz - r1, t.cx + r1, trunkTop + h1, t.cz + r1,
-                            leafUv, SurfaceColorResolver.applyShade(t.leafTint(), 0.90f));
-                    emitBox(builder, t.cx - r2, trunkTop + h1, t.cz - r2, t.cx + r2, trunkTop + h1 + h2, t.cz + r2,
-                            leafUv, t.leafTint());
-                    emitBox(builder, t.cx - r3, trunkTop + h1 + h2, t.cz - r3, t.cx + r3, trunkTop + h1 + h2 + h3, t.cz + r3,
-                            leafUv, SurfaceColorResolver.applyShade(t.leafTint(), 1.06f));
-                } else {
-                    float r1 = Math.max(2.0f, stepBlocks * 0.95f);
-                    float r2 = Math.max(1.2f, stepBlocks * 0.58f);
-                    float h1 = t.canopyH * 0.62f;
-                    float h2 = t.canopyH * 0.38f;
-                    emitBox(builder, t.cx - r1, trunkTop, t.cz - r1, t.cx + r1, trunkTop + h1, t.cz + r1,
-                            leafUv, t.leafTint());
-                    emitBox(builder, t.cx - r2, trunkTop + h1, t.cz - r2, t.cx + r2, trunkTop + h1 + h2, t.cz + r2,
-                            leafUv, SurfaceColorResolver.applyShade(t.leafTint(), 1.06f));
-                }
+                hasOpaque = true;
+                LodTreeShapes.emitTree(builder, t.cx(), t.groundY(), t.cz(), t.style(), t.seedHash(),
+                        stepBlocks, t.trunkMat(), t.leafMat(), t.leafTint());
             }
 
-            if (hasGeometry) {
+            if (hasOpaque) {
                 MeshData mesh = builder.build();
                 if (mesh != null) {
                     VertexBuffer vbo = new VertexBuffer(VertexBuffer.Usage.STATIC);
                     vbo.bind();
                     vbo.upload(mesh);
                     VertexBuffer.unbind();
-                    this.vertexBuffer = vbo;
+                    this.opaqueVbo = vbo;
                 }
             }
-            this.uploaded = true;
         }
+
+        // 2. Greedy-merged translucent water surface pass (drawn over underwater seabed!)
+        try (ByteBufferBuilder waterBuf = new ByteBufferBuilder(4096)) {
+            BufferBuilder wb = new BufferBuilder(waterBuf, VertexFormat.Mode.QUADS, DefaultVertexFormat.POSITION_TEX_COLOR);
+            boolean hasWater = false;
+            boolean[] mergedW = new boolean[gridWidth * gridWidth];
+            LodAtlasSprites.SpriteUv waterUv = LodAtlasSprites.getUv(LodAtlasSprites.Material.WATER);
+            float waterY = seaLevel + 0.85f;
+
+            for (int gz = 0; gz < gridWidth; gz++) {
+                for (int gx = 0; gx < gridWidth; gx++) {
+                    int idx = gz * gridWidth + gx;
+                    if (!isWaterGrid[idx] || mergedW[idx]) continue;
+                    hasWater = true;
+
+                    int tintRef = waterTints[idx];
+                    int runW = 1;
+                    while (gx + runW < gridWidth) {
+                        int nIdx = gz * gridWidth + (gx + runW);
+                        if (mergedW[nIdx] || !isWaterGrid[nIdx] || waterTints[nIdx] != tintRef) break;
+                        runW++;
+                    }
+                    int runH = 1;
+                    outerW:
+                    while (gz + runH < gridWidth) {
+                        for (int rx = 0; rx < runW; rx++) {
+                            int nIdx = (gz + runH) * gridWidth + (gx + rx);
+                            if (mergedW[nIdx] || !isWaterGrid[nIdx] || waterTints[nIdx] != tintRef) break outerW;
+                        }
+                        runH++;
+                    }
+                    for (int rz = 0; rz < runH; rz++) {
+                        for (int rx = 0; rx < runW; rx++) {
+                            mergedW[(gz + rz) * gridWidth + (gx + rx)] = true;
+                        }
+                    }
+
+                    float x0 = baseX + gx * stepBlocks;
+                    float z0 = baseZ + gz * stepBlocks;
+                    emitTopFace(wb, x0, waterY, z0, x0 + runW * stepBlocks, z0 + runH * stepBlocks, waterUv, tintRef);
+                }
+            }
+
+            if (hasWater) {
+                MeshData mesh = wb.build();
+                if (mesh != null) {
+                    VertexBuffer vbo = new VertexBuffer(VertexBuffer.Usage.STATIC);
+                    vbo.bind();
+                    vbo.upload(mesh);
+                    VertexBuffer.unbind();
+                    this.waterVbo = vbo;
+                }
+            }
+        }
+
+        this.uploaded = true;
     }
 
     private static void emitTopFace(BufferBuilder builder, float x0, float y, float z0, float x1, float z1,
@@ -340,30 +443,25 @@ public final class LodSection implements AutoCloseable {
         builder.addVertex(xB, yTop, zB).setUv(uv.u1(), uv.v0()).setColor(r, g, b, a);
     }
 
-    private static void emitBox(BufferBuilder builder, float x0, float y0, float z0, float x1, float y1, float z1,
-                                LodAtlasSprites.SpriteUv uv, int argb) {
-        emitTopFace(builder, x0, y1, z0, x1, z1, uv, argb);
-        int ns = SurfaceColorResolver.applyShade(argb, 0.80f);
-        int ew = SurfaceColorResolver.applyShade(argb, 0.86f);
-        emitQuad(builder, x1, z0, x0, z0, y1, y0, uv, ns);
-        emitQuad(builder, x0, z1, x1, z1, y1, y0, uv, ns);
-        emitQuad(builder, x0, z0, x0, z1, y1, y0, uv, ew);
-        emitQuad(builder, x1, z1, x1, z0, y1, y0, uv, ew);
-    }
-
     public int getChunkX() { return chunkX; }
     public int getChunkZ() { return chunkZ; }
     public AABB getBounds() { return bounds; }
     @Nullable
-    public VertexBuffer getVertexBuffer() { return vertexBuffer; }
+    public VertexBuffer getOpaqueVbo() { return opaqueVbo; }
+    @Nullable
+    public VertexBuffer getWaterVbo() { return waterVbo; }
     public boolean isUploaded() { return uploaded; }
 
     @Override
     public void close() {
         closed = true;
-        if (vertexBuffer != null) {
-            vertexBuffer.close();
-            vertexBuffer = null;
+        if (opaqueVbo != null) {
+            opaqueVbo.close();
+            opaqueVbo = null;
+        }
+        if (waterVbo != null) {
+            waterVbo.close();
+            waterVbo = null;
         }
     }
 }

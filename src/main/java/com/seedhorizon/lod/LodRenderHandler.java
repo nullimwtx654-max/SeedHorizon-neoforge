@@ -285,17 +285,11 @@ public final class LodRenderHandler {
         LOD_FBO.bindAndClear();
         GL20.glUseProgram(LOD_SHADER.getProgramId());
 
-        // Bind Minecraft's depth buffer to texture unit 0 and live BLOCK_ATLAS to unit 1
         GL13.glActiveTexture(GL13.GL_TEXTURE0);
-        GL11.glBindTexture(GL11.GL_TEXTURE_2D, mainTarget.getDepthTextureId());
-        GL20.glUniform1i(LOD_SHADER.getMcDepthLoc(), 0);
-
-        GL13.glActiveTexture(GL13.GL_TEXTURE1);
         GL11.glBindTexture(GL11.GL_TEXTURE_2D, LodAtlasSprites.getBlockAtlasTextureId());
-        GL20.glUniform1i(LOD_SHADER.getBlockAtlasLoc(), 1);
-        GL13.glActiveTexture(GL13.GL_TEXTURE0);
-        GL20.glUniform2f(LOD_SHADER.getScreenSizeLoc(), (float) viewW, (float) viewH);
+        GL20.glUniform1i(LOD_SHADER.getBlockAtlasLoc(), 0);
         GL20.glUniform1f(LOD_SHADER.getClipDistanceLoc(), clipDist);
+        GL20.glUniform1f(LOD_SHADER.getSeaLevelLoc(), (float) level.getSeaLevel());
 
         try (MemoryStack stack = MemoryStack.stackPush()) {
             FloatBuffer mvBuf = stack.mallocFloat(16);
@@ -316,24 +310,44 @@ public final class LodRenderHandler {
         int innerSkipSq = Math.max(1, SeedHorizonConfig.getRealRenderDistanceCap() - 3);
         innerSkipSq = innerSkipSq * innerSkipSq;
 
+        // Pass 1: Opaque terrain, underwater seabed, and organic 3D trees
+        java.util.List<LodSection> visibleWithWater = new java.util.ArrayList<>();
         for (LodSection sec : SECTIONS.values()) {
-            VertexBuffer vbo = sec.getVertexBuffer();
-            if (vbo == null || !sec.isUploaded()) {
+            if (!sec.isUploaded()) {
                 continue;
             }
-
             int dcx = sec.getChunkX() - playerChunkX;
             int dcz = sec.getChunkZ() - playerChunkZ;
             if (dcx * dcx + dcz * dcz < innerSkipSq) {
                 continue;
             }
-
             if (!frustum.isVisible(sec.getBounds())) {
                 continue;
             }
+            VertexBuffer opaque = sec.getOpaqueVbo();
+            if (opaque != null) {
+                opaque.bind();
+                opaque.draw();
+            }
+            if (sec.getWaterVbo() != null) {
+                visibleWithWater.add(sec);
+            }
+        }
 
-            vbo.bind();
-            vbo.draw();
+        // Pass 2: Translucent water surface over underwater seabed
+        if (!visibleWithWater.isEmpty()) {
+            RenderSystem.enableBlend();
+            RenderSystem.defaultBlendFunc();
+            RenderSystem.depthMask(false);
+            for (LodSection sec : visibleWithWater) {
+                VertexBuffer water = sec.getWaterVbo();
+                if (water != null) {
+                    water.bind();
+                    water.draw();
+                }
+            }
+            RenderSystem.depthMask(true);
+            RenderSystem.disableBlend();
         }
 
         VertexBuffer.unbind();
