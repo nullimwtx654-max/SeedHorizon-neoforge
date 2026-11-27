@@ -17,12 +17,8 @@ jobs:
           gradle-version: 8.10.2
       - name: Build JAR
         run: |
-          for z in *-src.zip; do
-            [ -f "$z" ] && unzip -q -o "$z"
-          done
-          PROJECT_DIR=$(dirname "$(find . -maxdepth 3 -name 'build.gradle' | head -n 1)")
-          echo "Building in $PROJECT_DIR"
-          cd "$PROJECT_DIR"
+          [ -f "VoxelRay-neoforge-1.21.1-src.zip" ] && unzip -q -o "VoxelRay-neoforge-1.21.1-src.zip"
+          cd voxelray-neoforge-1.21.1
           gradle build --no-daemon
           mkdir -p "$GITHUB_WORKSPACE/out-jars"
           cp build/libs/*.jar "$GITHUB_WORKSPACE/out-jars/"
