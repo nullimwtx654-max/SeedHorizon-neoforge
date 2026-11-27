@@ -20,7 +20,7 @@ jobs:
           gradle-version: 8.10.2
       - name: Build JAR
         run: |
-          cd seedhorizon-build/seedhorizon-neoforge-1.21.1
+          cd .
           gradle build --no-daemon
           mkdir -p "$GITHUB_WORKSPACE/out-jars"
           cp build/libs/*.jar "$GITHUB_WORKSPACE/out-jars/"
