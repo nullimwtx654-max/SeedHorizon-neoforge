@@ -3,6 +3,9 @@ on:
   workflow_dispatch:
   push:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -22,7 +25,9 @@ jobs:
           gradle build --no-daemon
           mkdir -p "$GITHUB_WORKSPACE/out-jars"
           cp build/libs/*.jar "$GITHUB_WORKSPACE/out-jars/"
-      - uses: actions/upload-artifact@v4
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: mod-jar
-          path: out-jars/*.jar
+          tag_name: v1.0.0-build-${{ github.run_number }}
+          name: VoxelRay Build ${{ github.run_number }}
+          files: out-jars/*.jar
