@@ -1,0 +1,33 @@
+# Gradle / Java
+.gradle/
+build/
+out-jars/
+!gradle/wrapper/gradle-wrapper.properties
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# Eclipse
+.classpath
+.project
+.settings/
+bin/
+
+# VS Code
+.vscode/
+
+# macOS
+.DS_Store
+
+# Local runtime / logs
+run/
+logs/
+*.log
+.build-log.txt
+
+# Harness scratch
+.harness/
