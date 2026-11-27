@@ -20,8 +20,7 @@ jobs:
           gradle-version: 8.10.2
       - name: Build JAR
         run: |
-          [ -f "VoxelRay-neoforge-1.21.1-src.zip" ] && unzip -q -o "VoxelRay-neoforge-1.21.1-src.zip"
-          cd voxelray-neoforge-1.21.1
+          cd seedhorizon-build/seedhorizon-neoforge-1.21.1
           gradle build --no-daemon
           mkdir -p "$GITHUB_WORKSPACE/out-jars"
           cp build/libs/*.jar "$GITHUB_WORKSPACE/out-jars/"
@@ -29,5 +28,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v1.0.0-build-${{ github.run_number }}
-          name: VoxelRay Build ${{ github.run_number }}
+          name: SeedHorizon Build ${{ github.run_number }}
           files: out-jars/*.jar
